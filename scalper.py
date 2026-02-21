@@ -46,6 +46,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 RPC_URL = os.getenv("RPC_URL", "https://polygon-bor-rpc.publicnode.com")
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_ABI = [
     {"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],
@@ -53,6 +54,10 @@ CTF_ABI = [
     {"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},
                 {"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],
      "name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"name":"owner","type":"address"},{"name":"operator","type":"address"}],
+     "name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],
+     "name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"},
 ]
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 POSITIONS_FILE = os.path.join(DATA_DIR, "scalp_positions.json")
@@ -67,7 +72,9 @@ clob = None
 w3 = None
 w3_account = None
 ctf_contract = None
+neg_risk_adapter = None
 relay_client = None
+bot_paused = False
 positions = []
 closed = []
 stats = {"wins": 0, "losses": 0, "pnl": 0.0}
@@ -363,22 +370,24 @@ def check_and_close_position(p, exit_reason):
 
 # ── Redemption (gasless via Builder relayer when available, else direct tx) ──
 
-def _redeem_via_relayer(condition_id):
+def _redeem_via_relayer(condition_id, token_id=None):
     """Gasless redeem through Polymarket Builder relayer."""
     try:
-        redeem_data = ctf_contract.encode_abi(
+        from py_builder_relayer_client.models import SafeTransaction, OperationType
+        # All scalper markets are neg_risk — use NegRiskAdapter
+        bal = ctf_contract.functions.balanceOf(w3_account.address, int(token_id)).call() if token_id else 0
+        amounts = [bal, 0]  # try as Yes outcome
+        redeem_data = neg_risk_adapter.encode_abi(
             abi_element_identifier="redeemPositions",
-            args=[
-                Web3.to_checksum_address(USDC_ADDRESS),
-                b"\x00" * 32,
-                Web3.to_bytes(hexstr=condition_id),
-                [1, 2],
-            ]
+            args=[Web3.to_bytes(hexstr=condition_id), amounts]
         )
-        response = relay_client.execute(
-            [{"to": CTF_ADDRESS, "data": redeem_data, "value": "0"}],
-            f"Redeem {condition_id[:16]}"
+        tx = SafeTransaction(
+            to=NEG_RISK_ADAPTER,
+            operation=OperationType.Call,
+            data=redeem_data,
+            value="0",
         )
+        response = relay_client.execute([tx], f"Redeem {condition_id[:16]}")
         result = response.wait()
         if result:
             log.info("REDEEMED (gasless) condition %s...", condition_id[:16])
@@ -389,18 +398,19 @@ def _redeem_via_relayer(condition_id):
         log.error("RELAYER REDEEM ERROR: %s — falling back to direct tx", e)
         return _redeem_direct(condition_id)
 
-def _redeem_direct(condition_id):
+def _redeem_direct(condition_id, token_id=None):
     """Direct on-chain redeem (EOA pays gas)."""
     try:
         gas_price = w3.eth.gas_price
         nonce = w3.eth.get_transaction_count(w3_account.address)
-        tx = ctf_contract.functions.redeemPositions(
-            Web3.to_checksum_address(USDC_ADDRESS),
-            b"\x00" * 32,
+        # All scalper markets are neg_risk — use NegRiskAdapter
+        bal = ctf_contract.functions.balanceOf(w3_account.address, int(token_id)).call() if token_id else 0
+        amounts = [bal, 0]  # try as Yes outcome
+        tx = neg_risk_adapter.functions.redeemPositions(
             Web3.to_bytes(hexstr=condition_id),
-            [1, 2]
+            amounts,
         ).build_transaction({
-            "from": w3_account.address, "nonce": nonce, "gas": 300_000,
+            "from": w3_account.address, "nonce": nonce, "gas": 400_000,
             "maxFeePerGas": int(gas_price * 1.5),
             "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
         })
@@ -416,10 +426,10 @@ def _redeem_direct(condition_id):
         log.error("REDEEM ERROR: %s", e)
         return False
 
-def redeem_position(condition_id):
+def redeem_position(condition_id, token_id=None):
     if relay_client:
-        return _redeem_via_relayer(condition_id)
-    return _redeem_direct(condition_id)
+        return _redeem_via_relayer(condition_id, token_id=token_id)
+    return _redeem_direct(condition_id, token_id=token_id)
 
 # ── Order placement ──
 
@@ -585,6 +595,7 @@ def api_status():
     portfolio_value = data_api_value()
     return jsonify({
         "bal": cache["bal"],
+        "paused": bot_paused,
         "pos": pos_data,
         "closed": closed[-50:],
         "stats": {
@@ -596,7 +607,22 @@ def api_status():
             "portfolio_value": portfolio_value,
             "builder_relayer": relay_client is not None,
         },
+        "timezone": "UTC",
     })
+
+@flask_app.route("/api/pause", methods=["POST"])
+def api_pause():
+    global bot_paused
+    bot_paused = True
+    log.info("BOT PAUSED by user")
+    return jsonify({"success": True, "paused": True})
+
+@flask_app.route("/api/resume", methods=["POST"])
+def api_resume():
+    global bot_paused
+    bot_paused = False
+    log.info("BOT RESUMED by user")
+    return jsonify({"success": True, "paused": False})
 
 @flask_app.route("/api/reconcile", methods=["POST"])
 def api_reconcile():
@@ -668,7 +694,8 @@ def init_builder_relayer():
         return
     try:
         from py_builder_relayer_client.client import RelayClient
-        from py_builder_signing_sdk import BuilderConfig, BuilderApiKeyCreds
+        from py_builder_signing_sdk.config import BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
         builder_config = BuilderConfig(
             local_builder_creds=BuilderApiKeyCreds(
                 key=BUILDER_KEY, secret=BUILDER_SECRET, passphrase=BUILDER_PASSPHRASE,
@@ -677,16 +704,25 @@ def init_builder_relayer():
         relay_client = RelayClient(
             "https://relayer-v2.polymarket.com", 137, PRIVATE_KEY, builder_config
         )
+        # Deploy Safe wallet if not yet deployed
+        safe_addr = relay_client.get_expected_safe()
+        if not relay_client.get_deployed(safe_addr):
+            log.info("Deploying Safe wallet %s via relayer...", safe_addr)
+            resp = relay_client.deploy()
+            resp.wait()
+            log.info("Safe wallet deployed: %s", safe_addr)
+        else:
+            log.info("Safe wallet already deployed: %s", safe_addr)
         log.info("Builder relayer: ENABLED (gasless redemptions)")
-    except ImportError:
-        log.warning("Builder relayer: py-builder-relayer-client not installed, using direct tx")
+    except ImportError as e:
+        log.warning("Builder relayer: import error — %s, using direct tx", e)
     except Exception as e:
         log.warning("Builder relayer init failed: %s — using direct tx", e)
 
 # ── Main loop ──
 
 def run():
-    global clob, w3, w3_account, ctf_contract, positions, closed
+    global clob, w3, w3_account, ctf_contract, neg_risk_adapter, positions, closed
     log.info("Scalper v9 | $%.0f @ $%.2f | %s | Data API + Builder relayer", BID_AMOUNT, BID_PRICE, "+".join(ASSETS))
     clob = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=POLYGON)
     creds = clob.create_or_derive_api_creds()
@@ -694,6 +730,25 @@ def run():
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
     w3_account = w3.eth.account.from_key(PRIVATE_KEY)
     ctf_contract = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
+    neg_risk_adapter = w3.eth.contract(
+        address=Web3.to_checksum_address(NEG_RISK_ADAPTER),
+        abi=[{"inputs": [{"name": "_conditionId", "type": "bytes32"}, {"name": "_amounts", "type": "uint256[]"}],
+              "name": "redeemPositions", "outputs": [], "stateMutability": "nonpayable", "type": "function"}])
+    # Ensure CTF approval for NegRiskAdapter
+    try:
+        _approved = ctf_contract.functions.isApprovedForAll(w3_account.address, NEG_RISK_ADAPTER).call()
+        if not _approved:
+            log.info("Setting CTF approval for NegRiskAdapter...")
+            _n = w3.eth.get_transaction_count(w3_account.address)
+            _atx = ctf_contract.functions.setApprovalForAll(NEG_RISK_ADAPTER, True).build_transaction({
+                "from": w3_account.address, "nonce": _n, "gas": 100_000,
+                "maxFeePerGas": int(w3.eth.gas_price * 1.5),
+                "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),})
+            _s = w3_account.sign_transaction(_atx)
+            w3.eth.send_raw_transaction(_s.raw_transaction)
+            log.info("CTF approved for NegRiskAdapter")
+    except Exception as e:
+        log.warning("Approval check failed: %s", e)
     init_builder_relayer()
     log.info("CLOB+Web3 ready | USDC: $%.2f | wallet: %s", usdc_balance(), w3_account.address)
     positions = load_json(POSITIONS_FILE, [])
@@ -726,10 +781,14 @@ def run():
             now_ts = int(time.time())
             tl = ((now_ts // 900) * 900 + 900) - now_ts
             pnl = compute_trade_pnl()
-            log.info("-- tick -- %d pos | $%.2f | %d mkts | P&L $%+.2f | %dW/%dL | window %dm%ds --",
-                     len(positions), bal, len(markets), pnl, stats["wins"], stats["losses"], tl // 60, tl % 60)
-            for mkt in markets:
-                place_bids(mkt)
+            paused_tag = " PAUSED" if bot_paused else ""
+            log.info("-- tick -- %d pos | $%.2f | %d mkts | P&L $%+.2f | %dW/%dL | window %dm%ds%s --",
+                     len(positions), bal, len(markets), pnl, stats["wins"], stats["losses"], tl // 60, tl % 60, paused_tag)
+            if not bot_paused:
+                for mkt in markets:
+                    place_bids(mkt)
+            else:
+                log.info("Paused — skipping bid placement")
         except Exception as e:
             log.error("Loop error: %s", e)
         time.sleep(POLL_SECONDS)
