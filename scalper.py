@@ -73,6 +73,14 @@ w3 = None
 w3_account = None
 ctf_contract = None
 neg_risk_adapter = None
+usdc_contract = None
+
+ERC20_ABI = [
+    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+     "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
+    {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}],
+     "name": "transfer", "outputs": [{"name": "", "type": "bool"}], "type": "function"},
+]
 relay_client = None
 bot_paused = False
 positions = []
@@ -608,6 +616,8 @@ def api_status():
             "builder_relayer": relay_client is not None,
         },
         "timezone": "UTC",
+        "gas_balance": round(w3.eth.get_balance(w3_account.address) / 1e18, 6) if w3 and w3_account else 0,
+        "wallet": w3_account.address if w3_account else "",
     })
 
 @flask_app.route("/api/pause", methods=["POST"])
@@ -684,6 +694,41 @@ def api_cancel():
         return jsonify({"msg": "Bid cancelled"})
     return jsonify({"err": "Not a pending bid"})
 
+
+@flask_app.route("/api/withdraw", methods=["POST"])
+def api_withdraw():
+    if not w3 or not w3_account or not usdc_contract:
+        return jsonify({"success": False, "error": "Bot not initialized"})
+    data = flask_request.get_json()
+    to_addr = data.get("to", "").strip()
+    amount = data.get("amount", 0)
+    if not to_addr or not Web3.is_address(to_addr):
+        return jsonify({"success": False, "error": "Invalid address"})
+    if amount <= 0:
+        return jsonify({"success": False, "error": "Invalid amount"})
+    try:
+        raw_amount = int(amount * 1e6)
+        bal = usdc_contract.functions.balanceOf(w3_account.address).call()
+        if raw_amount > bal:
+            return jsonify({"success": False, "error": f"Insufficient balance: ${bal/1e6:.2f}"})
+        tx = usdc_contract.functions.transfer(
+            Web3.to_checksum_address(to_addr), raw_amount
+        ).build_transaction({
+            "from": w3_account.address,
+            "nonce": w3.eth.get_transaction_count(w3_account.address),
+            "gas": 100_000,
+            "gasPrice": w3.eth.gas_price,
+        })
+        signed = w3_account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt.status == 1:
+            log.info("Withdraw $%.2f USDC to %s TX: %s", amount, to_addr, tx_hash.hex())
+            return jsonify({"success": True, "tx_hash": tx_hash.hex()})
+        return jsonify({"success": False, "error": "Transaction reverted"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
 # ── Builder relayer init ──
 
 def init_builder_relayer():
@@ -722,7 +767,7 @@ def init_builder_relayer():
 # ── Main loop ──
 
 def run():
-    global clob, w3, w3_account, ctf_contract, neg_risk_adapter, positions, closed
+    global clob, w3, w3_account, ctf_contract, neg_risk_adapter, usdc_contract, positions, closed
     log.info("Scalper v9 | $%.0f @ $%.2f | %s | Data API + Builder relayer", BID_AMOUNT, BID_PRICE, "+".join(ASSETS))
     clob = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=POLYGON)
     creds = clob.create_or_derive_api_creds()
@@ -730,6 +775,7 @@ def run():
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
     w3_account = w3.eth.account.from_key(PRIVATE_KEY)
     ctf_contract = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
+    usdc_contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
     neg_risk_adapter = w3.eth.contract(
         address=Web3.to_checksum_address(NEG_RISK_ADAPTER),
         abi=[{"inputs": [{"name": "_conditionId", "type": "bytes32"}, {"name": "_amounts", "type": "uint256[]"}],

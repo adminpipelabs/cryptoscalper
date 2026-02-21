@@ -54,11 +54,23 @@ h2{font-size:0.9rem;margin:12px 0 6px;color:#ccc}
   <div class="card"><div class="val" id="wr">...</div><div class="lbl">W / L</div></div>
   <div class="card"><div class="val" id="pnl">...</div><div class="lbl">Trade P&amp;L</div></div>
   <div class="card"><div class="val" id="cost">...</div><div class="lbl">Open Cost</div></div>
+  <div class="card"><div class="val" id="gas">...</div><div class="lbl">Gas (POL)</div></div>
 </div>
 <h2>Active</h2>
 <div id="pos"></div>
 <h2>Closed (last 50)</h2>
 <div id="cls"></div>
+<div style="background:#1a1a1a;border-radius:8px;padding:12px;margin-top:12px">
+  <h2 style="margin:0 0 8px">Withdraw USDC</h2>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input type="text" id="wAddr" placeholder="0x... recipient address" style="flex:1;min-width:180px;padding:8px;border-radius:6px;border:1px solid #333;background:#0a0a0a;color:#e5e5e5;font-family:inherit;font-size:0.82rem">
+    <input type="number" id="wAmt" placeholder="Amount" step="0.01" style="width:100px;padding:8px;border-radius:6px;border:1px solid #333;background:#0a0a0a;color:#e5e5e5;font-family:inherit;font-size:0.82rem">
+    <button class="btn blue" onclick="doWithdraw()" id="wBtn" style="padding:8px 16px">Send</button>
+  </div>
+  <div id="wMsg" style="margin-top:6px;font-size:0.8rem"></div>
+  <div style="margin-top:6px;font-size:0.68rem;color:#555">Wallet: <span id="wallet" style="font-family:monospace"></span></div>
+</div>
+
 <script>
 var _paused=false;
 function etFmt(s){if(!s)return'--';var d=new Date(s);return d.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'America/New_York'})+' '+d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'America/New_York'})+' ET';}
@@ -80,6 +92,20 @@ function cancelOrder(tokenId){
   if(!confirm("Cancel bid?"))return;
   fetch("/api/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token_id:tokenId})})
   .then(function(r){return r.json()}).then(function(d){alert(d.msg||d.err);refresh()}).catch(function(e){alert("Error: "+e.message)});
+}
+function doWithdraw(){
+  var addr=document.getElementById("wAddr").value.trim();
+  var amt=document.getElementById("wAmt").value.trim();
+  var msg=document.getElementById("wMsg");
+  var btn=document.getElementById("wBtn");
+  if(!addr||!amt){msg.innerHTML='<span style="color:#ef4444">Enter address and amount</span>';return;}
+  btn.disabled=true;btn.textContent="Sending...";msg.innerHTML="";
+  fetch("/api/withdraw",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({to:addr,amount:parseFloat(amt)})})
+  .then(function(r){return r.json()}).then(function(d){
+    if(d.success){msg.innerHTML='<span style="color:#10b981">Sent! TX: '+d.tx_hash.slice(0,20)+'...</span>';document.getElementById("wAmt").value="";setTimeout(refresh,3000);}
+    else{msg.innerHTML='<span style="color:#ef4444">'+d.error+'</span>';}
+  }).catch(function(){msg.innerHTML='<span style="color:#ef4444">Request failed</span>';});
+  btn.disabled=false;btn.textContent="Send";
 }
 function doReconcile(){
   fetch("/api/reconcile",{method:"POST"}).then(function(r){return r.json()}).then(function(d){alert(d.msg||JSON.stringify(d));refresh()}).catch(function(e){alert("Error: "+e.message)});
@@ -111,6 +137,8 @@ function refresh(){
     setEl("pnl",(tp>=0?"+$":"-$")+Math.abs(tp).toFixed(2),tp>=0?"val":"val neg");
     var oc=d.stats.open_cost||0;
     setEl("cost","$"+oc.toFixed(2));
+    setEl("gas",(d.gas_balance||0).toFixed(4));
+    var walletEl=document.getElementById("wallet");if(walletEl)walletEl.textContent=d.wallet||"";
 
     var now=Math.floor(Date.now()/1000);
     var p='<table><tr><th>Market</th><th>Side</th><th>Shares</th><th>Buy Price</th><th>Market Bid</th><th>Time Left</th><th>Status</th><th>Actions</th></tr>';
