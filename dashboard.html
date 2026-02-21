@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Crypto Scalper</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a0a;color:#e5e5e5;padding:12px}
+h1{font-size:1.1rem;margin-bottom:8px;color:#10b981}
+.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px}
+.card{background:#1a1a1a;border-radius:8px;padding:10px;text-align:center}
+.card .val{font-size:1.3rem;font-weight:700;color:#10b981}
+.card .lbl{font-size:0.68rem;color:#888;margin-top:2px}
+.neg{color:#ef4444!important}
+table{width:100%;border-collapse:collapse;font-size:0.78rem;margin-bottom:12px}
+th{text-align:left;color:#888;padding:5px 8px;border-bottom:1px solid #333}
+td{padding:5px 8px;border-bottom:1px solid #1a1a1a}
+.up{color:#10b981}.down{color:#ef4444}
+.tag{padding:2px 8px;border-radius:3px;font-size:0.68rem;font-weight:600;display:inline-block}
+.tag.pending{background:#2a2a1a;color:#f59e0b}
+.tag.held{background:#1a3a2a;color:#10b981}
+.tag.won{background:#1a3a2a;color:#10b981}
+.tag.lost{background:#3a1a1a;color:#ef4444}
+.tag.lost_unfilled{background:#2a2a2a;color:#888}
+.tag.cancelled{background:#2a2a2a;color:#888}
+.tag.expired{background:#2a2a2a;color:#888}
+.tag.manual_sell{background:#1a2a3a;color:#3b82f6}
+.tag.up{background:#1a3a2a;color:#10b981}
+.tag.down{background:#3a1a1a;color:#ef4444}
+.btn{border:none;color:white;padding:4px 10px;border-radius:4px;font-size:0.72rem;cursor:pointer;font-weight:600}
+.btn.red{background:#ef4444}.btn.red:hover{background:#dc2626}
+.btn.yellow{background:#f59e0b}.btn.yellow:hover{background:#d97706}
+.actions{display:flex;gap:4px}
+h2{font-size:0.9rem;margin:12px 0 6px;color:#ccc}
+.timer{color:#f59e0b;font-weight:600}
+#err{color:#ef4444;padding:8px;font-size:0.8rem;display:none}
+</style></head><body>
+<h1>Crypto Scalper v7</h1>
+<div id="err"></div>
+<div class="cards">
+  <div class="card"><div class="val" id="bal">...</div><div class="lbl">USDC Balance</div></div>
+  <div class="card"><div class="val" id="cnt">...</div><div class="lbl">Positions / Bids</div></div>
+  <div class="card"><div class="val" id="wr">...</div><div class="lbl">W / L</div></div>
+  <div class="card"><div class="val" id="pnl">...</div><div class="lbl">Trade P&amp;L</div></div>
+  <div class="card"><div class="val" id="tv">...</div><div class="lbl">Total Value</div></div>
+</div>
+<h2>Active</h2>
+<div id="pos"></div>
+<h2>Closed (last 50)</h2>
+<div id="cls"></div>
+<script>
+function setEl(id,txt,cls){var e=document.getElementById(id);if(e){e.textContent=txt;if(cls)e.className=cls;}}
+function sellNow(tokenId){
+  if(!confirm("Sell position now?"))return;
+  fetch("/api/sell",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token_id:tokenId})})
+  .then(function(r){return r.json()}).then(function(d){alert(d.msg||d.err);refresh()}).catch(function(e){alert("Error: "+e.message)});
+}
+function cancelOrder(tokenId){
+  if(!confirm("Cancel bid?"))return;
+  fetch("/api/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token_id:tokenId})})
+  .then(function(r){return r.json()}).then(function(d){alert(d.msg||d.err);refresh()}).catch(function(e){alert("Error: "+e.message)});
+}
+function refresh(){
+  fetch("/api/status").then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(d){
+    document.getElementById("err").style.display="none";
+    setEl("bal","$"+d.bal.toFixed(2));
+    var held=0,pending=0;
+    for(var i=0;i<d.pos.length;i++){if(d.pos[i].status==="held")held++;if(d.pos[i].status==="pending")pending++;}
+    setEl("cnt",held+" held / "+pending+" bids");
+    setEl("wr",d.stats.wins+"W / "+d.stats.losses+"L");
+    var tp=d.stats.trade_pnl||0;
+    setEl("pnl",(tp>=0?"+$":"-$")+Math.abs(tp).toFixed(2),tp>=0?"val":"val neg");
+    setEl("tv","$"+(d.stats.total_value||0).toFixed(2));
+    var now=Math.floor(Date.now()/1000);
+    var p='<table><tr><th>Market</th><th>Side</th><th>Shares</th><th>Buy Price</th><th>Market Bid</th><th>Time Left</th><th>Status</th><th>Actions</th></tr>';
+    for(var i=0;i<d.pos.length;i++){
+      var x=d.pos[i];
+      var tl=Math.max(0,x.end_ts-now);
+      var tm=tl>0?Math.floor(tl/60)+"m "+(tl%60)+"s":"ENDED";
+      var sc=x.side==="Up"?"up":"down";
+      var mb=(x.bid!=null)?"$"+x.bid.toFixed(2):"--";
+      var price,status,btns;
+      if(x.status==="pending"){
+        price='<span style="color:#f59e0b">$'+x.buy_price.toFixed(2)+' BID</span>';
+        status='<span class="tag pending">OPEN BID</span>';
+        btns='<button class="btn yellow" onclick="cancelOrder(\''+x.token_id+'\')">CANCEL</button>';
+      }else{
+        price="$"+x.buy_price.toFixed(2);
+        status='<span class="tag held">POSITION</span>';
+        btns='<button class="btn red" onclick="sellNow(\''+x.token_id+'\')">SELL NOW</button>';
+      }
+      p+='<tr><td>'+x.asset.toUpperCase()+' '+x.side+'</td><td><span class="tag '+sc+'">'+x.side+'</span></td><td>'+x.size+'</td><td>'+price+'</td><td>'+mb+'</td><td class="timer">'+tm+'</td><td>'+status+'</td><td><div class="actions">'+btns+'</div></td></tr>';
+    }
+    if(d.pos.length===0)p+='<tr><td colspan="8" style="color:#555;text-align:center">No active positions</td></tr>';
+    var posEl=document.getElementById("pos");if(posEl)posEl.innerHTML=p+'</table>';
+    var closed=d.closed||[];
+    var c='<table><tr><th>Market</th><th>Side</th><th>Buy</th><th>Exit</th><th>P&amp;L</th><th>Result</th><th>Time</th></tr>';
+    for(var i=closed.length-1;i>=0;i--){
+      var x=closed[i];
+      var pnlVal=x.pnl||0;
+      var pc=pnlVal>0?"up":(pnlVal<0?"down":"");
+      var et=(x.exit_type||"").toUpperCase();
+      if(et==="LOST_UNFILLED")et="NO FILL";
+      c+='<tr><td>'+(x.asset||"").toUpperCase()+' '+(x.side||"")+'</td>';
+      c+='<td><span class="tag '+((x.side||"").toLowerCase())+'">'+(x.side||"")+'</span></td>';
+      c+='<td>$'+(x.buy_price||0).toFixed(2)+'</td>';
+      c+='<td>$'+(x.exit_price||0).toFixed(2)+'</td>';
+      c+='<td class="'+pc+'">'+(pnlVal>0?"+$":pnlVal<0?"-$":"$")+Math.abs(pnlVal).toFixed(2)+'</td>';
+      c+='<td><span class="tag '+(x.exit_type||"")+'">'+et+'</span></td>';
+      c+='<td>'+(x.closed_at?x.closed_at.slice(11,19):"")+'</td></tr>';
+    }
+    if(closed.length===0)c+='<tr><td colspan="7" style="color:#555;text-align:center">No closed positions</td></tr>';
+    var clsEl=document.getElementById("cls");if(clsEl)clsEl.innerHTML=c+'</table>';
+  }).catch(function(e){
+    var errEl=document.getElementById("err");if(errEl){errEl.textContent="Dashboard error: "+e.message;errEl.style.display="block";}
+  });
+}
+refresh();setInterval(refresh,5000);
+</script></body></html>
