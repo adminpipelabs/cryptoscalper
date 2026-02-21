@@ -1,5 +1,5 @@
 """
-Crypto Scalper v8 — On-chain balance checks, reliable redemption
+Crypto Scalper v9 — Data API reconciliation + Builder relayer (gasless)
 """
 import os, json, time, logging, threading, requests
 from datetime import datetime, timezone
@@ -43,6 +43,7 @@ PORT = int(os.getenv("SCALP_PORT", "8081"))
 ASSETS = ["eth", "btc", "sol"]
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 RPC_URL = os.getenv("RPC_URL", "https://polygon-bor-rpc.publicnode.com")
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -57,15 +58,23 @@ DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 POSITIONS_FILE = os.path.join(DATA_DIR, "scalp_positions.json")
 CLOSED_FILE = os.path.join(DATA_DIR, "scalp_closed.json")
 
+BUILDER_KEY = os.getenv("POLY_BUILDER_API_KEY", "")
+BUILDER_SECRET = os.getenv("POLY_BUILDER_SECRET", "")
+BUILDER_PASSPHRASE = os.getenv("POLY_BUILDER_PASSPHRASE", "")
+RECONCILE_INTERVAL = 120  # seconds between Data API reconciliation sweeps
+
 clob = None
 w3 = None
 w3_account = None
 ctf_contract = None
+relay_client = None
 positions = []
 closed = []
 stats = {"wins": 0, "losses": 0, "pnl": 0.0}
-cache = {"bal": 0, "bids": {}}
+cache = {"bal": 0, "bids": {}, "last_reconcile": 0}
 flask_app = Flask(__name__)
+
+# ── Persistence ──
 
 def load_json(path, default):
     try:
@@ -75,6 +84,8 @@ def load_json(path, default):
 def save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f: json.dump(data, f, indent=2)
+
+# ── Market discovery ──
 
 def find_current_markets():
     now = int(time.time())
@@ -120,6 +131,8 @@ def find_current_markets():
                 log.debug("Discovery fail %s: %s", slug, e)
     return markets
 
+# ── Balance helpers ──
+
 def usdc_balance():
     try:
         b = clob.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
@@ -127,7 +140,7 @@ def usdc_balance():
     except Exception: return 0.0
 
 def token_balance_onchain(token_id):
-    """Authoritative on-chain CTF balance — used for all critical decisions."""
+    """Authoritative on-chain CTF balance."""
     try:
         return ctf_contract.functions.balanceOf(w3_account.address, int(token_id)).call() // 1_000_000
     except Exception as e:
@@ -144,6 +157,105 @@ def token_balance(token_id):
         return int(b.get("balance", 0)) // 1_000_000
     except Exception:
         return 0
+
+# ── Data API (Polymarket's authoritative position tracker) ──
+
+def data_api_positions():
+    """Fetch open positions from Polymarket Data API — the source of truth."""
+    try:
+        r = requests.get(f"{DATA_API}/positions", params={"user": w3_account.address.lower()}, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        log.debug("Data API positions error: %s", e)
+    return []
+
+def data_api_value():
+    """Fetch total portfolio value from Data API."""
+    try:
+        r = requests.get(f"{DATA_API}/value", params={"user": w3_account.address.lower()}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                return data[0].get("value", 0)
+    except Exception:
+        pass
+    return 0
+
+def reconcile_positions():
+    """
+    Compare bot's internal position list with Polymarket's Data API.
+    Adopt any positions the bot lost track of and redeem any redeemable ones.
+    """
+    now = time.time()
+    if now - cache.get("last_reconcile", 0) < RECONCILE_INTERVAL:
+        return
+    cache["last_reconcile"] = now
+
+    api_positions = data_api_positions()
+    if not api_positions:
+        return
+
+    tracked_tokens = {p["token_id"] for p in positions}
+    changed = False
+
+    for ap in api_positions:
+        token_id = ap.get("asset", "")
+        condition_id = ap.get("conditionId", "")
+        redeemable = ap.get("redeemable", False)
+        size = ap.get("size", 0)
+        outcome = ap.get("outcome", "")
+        title = ap.get("title", "")
+        slug = ap.get("slug", "")
+        cur_price = ap.get("curPrice", 0)
+
+        if redeemable and condition_id:
+            log.info("RECONCILE: redeemable position found — %s %s (%.0f tokens @ $%.2f)", title[:40], outcome, size, cur_price)
+            redeem_position(condition_id)
+            time.sleep(2)
+            actual = token_balance_onchain(token_id) if token_id else -1
+            if actual == 0:
+                pnl = round(size * 1.0 - size * float(ap.get("avgPrice", BID_PRICE)), 2)
+                closed.append({
+                    "token_id": token_id, "condition_id": condition_id,
+                    "side": outcome, "asset": slug.split("-")[0] if slug else "?",
+                    "title": title, "size": size, "cost": round(size * float(ap.get("avgPrice", BID_PRICE)), 2),
+                    "exit_type": "won" if cur_price >= 0.99 else "reconciled",
+                    "exit_price": cur_price, "pnl": pnl,
+                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "data_api_reconcile",
+                })
+                stats["pnl"] += pnl
+                stats["wins"] += 1
+                log.info("RECONCILE REDEEMED: %s %s | P&L $%+.2f", title[:40], outcome, pnl)
+                if token_id in tracked_tokens:
+                    positions[:] = [p for p in positions if p["token_id"] != token_id]
+                changed = True
+                continue
+
+        if token_id and token_id not in tracked_tokens and size > 0:
+            asset_name = slug.split("-")[0] if slug else "?"
+            end_ts_str = ap.get("endDate", "")
+            positions.append({
+                "token_id": token_id, "buy_order_id": "adopted",
+                "buy_price": float(ap.get("avgPrice", BID_PRICE)),
+                "size": int(size), "cost": round(size * float(ap.get("avgPrice", BID_PRICE)), 2),
+                "side": outcome, "asset": asset_name, "title": title, "slug": slug,
+                "market_id": "", "condition_id": condition_id,
+                "tick_size": 0.01, "neg_risk": ap.get("negativeRisk", False),
+                "end_ts": int(time.time()) + 900,
+                "sell_order_id": None, "sell_price": None, "status": "held",
+                "placed_at": datetime.now(timezone.utc).isoformat(),
+                "source": "data_api_adopted",
+            })
+            log.info("RECONCILE ADOPTED: %s %s — %.0f tokens (was untracked)", title[:40], outcome, size)
+            changed = True
+
+    if changed:
+        save_json(POSITIONS_FILE, positions)
+        save_json(CLOSED_FILE, closed[-500:])
+
+# ── Order book helpers ──
 
 def get_book(token_id):
     try:
@@ -208,6 +320,8 @@ def get_market_winner(market_id):
         pass
     return None
 
+# ── Position lifecycle ──
+
 def check_and_close_position(p, exit_reason):
     actual = token_balance(p["token_id"])
     if actual > 0:
@@ -247,7 +361,36 @@ def check_and_close_position(p, exit_reason):
     log.info("%s %s %s (confirmed 0 on-chain)", exit_reason.upper(), p["asset"].upper(), p["side"])
     return True
 
-def redeem_position(condition_id):
+# ── Redemption (gasless via Builder relayer when available, else direct tx) ──
+
+def _redeem_via_relayer(condition_id):
+    """Gasless redeem through Polymarket Builder relayer."""
+    try:
+        redeem_data = ctf_contract.encode_abi(
+            abi_element_identifier="redeemPositions",
+            args=[
+                Web3.to_checksum_address(USDC_ADDRESS),
+                b"\x00" * 32,
+                Web3.to_bytes(hexstr=condition_id),
+                [1, 2],
+            ]
+        )
+        response = relay_client.execute(
+            [{"to": CTF_ADDRESS, "data": redeem_data, "value": "0"}],
+            f"Redeem {condition_id[:16]}"
+        )
+        result = response.wait()
+        if result:
+            log.info("REDEEMED (gasless) condition %s...", condition_id[:16])
+            return True
+        log.error("RELAYER REDEEM FAILED %s...", condition_id[:16])
+        return False
+    except Exception as e:
+        log.error("RELAYER REDEEM ERROR: %s — falling back to direct tx", e)
+        return _redeem_direct(condition_id)
+
+def _redeem_direct(condition_id):
+    """Direct on-chain redeem (EOA pays gas)."""
     try:
         gas_price = w3.eth.gas_price
         nonce = w3.eth.get_transaction_count(w3_account.address)
@@ -265,13 +408,20 @@ def redeem_position(condition_id):
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
         if receipt.status == 1:
-            log.info("REDEEMED condition %s...", condition_id[:16])
+            log.info("REDEEMED (direct) condition %s...", condition_id[:16])
             return True
         log.error("REDEEM REVERTED %s...", condition_id[:16])
         return False
     except Exception as e:
         log.error("REDEEM ERROR: %s", e)
         return False
+
+def redeem_position(condition_id):
+    if relay_client:
+        return _redeem_via_relayer(condition_id)
+    return _redeem_direct(condition_id)
+
+# ── Order placement ──
 
 def place_bids(market):
     asset = market["asset"].upper()
@@ -403,7 +553,6 @@ def manage():
         save_json(POSITIONS_FILE, positions); save_json(CLOSED_FILE, closed[-500:])
 
 def compute_trade_pnl():
-    """P&L from trades only: closed results + unrealized on held positions."""
     total = stats["pnl"]
     now = int(time.time())
     for p in positions:
@@ -414,6 +563,8 @@ def compute_trade_pnl():
             elif winner:
                 total += round(-p["cost"], 2)
     return round(total, 2)
+
+# ── Dashboard & API ──
 
 @flask_app.route("/")
 def dash():
@@ -431,6 +582,7 @@ def api_status():
         pos_data.append(d)
     trade_pnl = compute_trade_pnl()
     open_cost = sum(p.get("cost", 0) for p in positions if p["status"] in ("held", "pending"))
+    portfolio_value = data_api_value()
     return jsonify({
         "bal": cache["bal"],
         "pos": pos_data,
@@ -441,8 +593,17 @@ def api_status():
             "pnl": stats["pnl"],
             "trade_pnl": trade_pnl,
             "open_cost": open_cost,
+            "portfolio_value": portfolio_value,
+            "builder_relayer": relay_client is not None,
         },
     })
+
+@flask_app.route("/api/reconcile", methods=["POST"])
+def api_reconcile():
+    """Manual trigger for Data API reconciliation."""
+    cache["last_reconcile"] = 0
+    reconcile_positions()
+    return jsonify({"msg": "Reconciliation complete", "positions": len(positions)})
 
 @flask_app.route("/api/sell", methods=["POST"])
 def api_sell():
@@ -497,15 +658,43 @@ def api_cancel():
         return jsonify({"msg": "Bid cancelled"})
     return jsonify({"err": "Not a pending bid"})
 
+# ── Builder relayer init ──
+
+def init_builder_relayer():
+    """Initialize Builder relayer for gasless transactions (optional)."""
+    global relay_client
+    if not (BUILDER_KEY and BUILDER_SECRET and BUILDER_PASSPHRASE):
+        log.info("Builder relayer: disabled (no POLY_BUILDER_* env vars)")
+        return
+    try:
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_signing_sdk import BuilderConfig, BuilderApiKeyCreds
+        builder_config = BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(
+                key=BUILDER_KEY, secret=BUILDER_SECRET, passphrase=BUILDER_PASSPHRASE,
+            )
+        )
+        relay_client = RelayClient(
+            "https://relayer-v2.polymarket.com", 137, PRIVATE_KEY, builder_config
+        )
+        log.info("Builder relayer: ENABLED (gasless redemptions)")
+    except ImportError:
+        log.warning("Builder relayer: py-builder-relayer-client not installed, using direct tx")
+    except Exception as e:
+        log.warning("Builder relayer init failed: %s — using direct tx", e)
+
+# ── Main loop ──
+
 def run():
     global clob, w3, w3_account, ctf_contract, positions, closed
-    log.info("Scalper v8 | $%.0f @ $%.2f | %s | on-chain balance checks", BID_AMOUNT, BID_PRICE, "+".join(ASSETS))
+    log.info("Scalper v9 | $%.0f @ $%.2f | %s | Data API + Builder relayer", BID_AMOUNT, BID_PRICE, "+".join(ASSETS))
     clob = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=POLYGON)
     creds = clob.create_or_derive_api_creds()
     clob.set_api_creds(creds)
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
     w3_account = w3.eth.account.from_key(PRIVATE_KEY)
     ctf_contract = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
+    init_builder_relayer()
     log.info("CLOB+Web3 ready | USDC: $%.2f | wallet: %s", usdc_balance(), w3_account.address)
     positions = load_json(POSITIONS_FILE, [])
     closed = load_json(CLOSED_FILE, [])
@@ -517,6 +706,10 @@ def run():
             stats["losses"] += 1
         stats["pnl"] += c.get("pnl", 0)
     log.info("Stats: %d W / %d L | trade P&L $%+.2f", stats["wins"], stats["losses"], stats["pnl"])
+
+    reconcile_positions()
+    log.info("Initial reconciliation done — portfolio value: $%.2f", data_api_value())
+
     while True:
         try:
             bal = usdc_balance()
@@ -528,6 +721,7 @@ def run():
                     pass
             cancel_stale_bids()
             manage()
+            reconcile_positions()
             markets = find_current_markets()
             now_ts = int(time.time())
             tl = ((now_ts // 900) * 900 + 900) - now_ts
