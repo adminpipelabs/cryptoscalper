@@ -1,5 +1,5 @@
 """
-Crypto Scalper v7 — Trade-based P&L, no hardcoded values
+Crypto Scalper v8 — On-chain balance checks, reliable redemption
 """
 import os, json, time, logging, threading, requests
 from datetime import datetime, timezone
@@ -126,11 +126,24 @@ def usdc_balance():
         return int(b.get("balance", 0)) / 1e6
     except Exception: return 0.0
 
+def token_balance_onchain(token_id):
+    """Authoritative on-chain CTF balance — used for all critical decisions."""
+    try:
+        return ctf_contract.functions.balanceOf(w3_account.address, int(token_id)).call() // 1_000_000
+    except Exception as e:
+        log.warning("On-chain balance failed %s: %s", str(token_id)[:20], e)
+        return -1
+
 def token_balance(token_id):
+    """On-chain first, CLOB fallback only if RPC fails."""
+    onchain = token_balance_onchain(token_id)
+    if onchain >= 0:
+        return onchain
     try:
         b = clob.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id))
         return int(b.get("balance", 0)) // 1_000_000
-    except Exception: return 0
+    except Exception:
+        return 0
 
 def get_book(token_id):
     try:
@@ -204,18 +217,34 @@ def check_and_close_position(p, exit_reason):
         return False
     st = order_status(p["buy_order_id"])
     if st == "FILLED":
+        actual2 = token_balance_onchain(p["token_id"])
+        if actual2 > 0:
+            p["size"] = actual2
+            p["status"] = "held"
+            log.info("ORDER FILLED %s %s (on-chain %d)", p["asset"].upper(), p["side"], actual2)
+            return False
         p["status"] = "held"
         p["size"] = int(p.get("cost", BID_AMOUNT) / p.get("buy_price", BID_PRICE))
-        log.info("ORDER FILLED %s %s (was %s), keeping as held", p["asset"].upper(), p["side"], exit_reason)
+        log.info("ORDER FILLED %s %s (CLOB=filled, keeping held)", p["asset"].upper(), p["side"])
+        return False
+    if st == "UNKNOWN":
+        log.warning("STATUS UNKNOWN %s %s, keeping position", p["asset"].upper(), p["side"])
         return False
     cancel_order(p["buy_order_id"])
+    time.sleep(1)
+    recheck = token_balance_onchain(p["token_id"])
+    if recheck > 0:
+        p["size"] = recheck
+        p["status"] = "held"
+        log.info("POST-CANCEL RECOVERY %s %s: %d tokens on-chain", p["asset"].upper(), p["side"], recheck)
+        return False
     p["status"] = "done"
     p["exit_type"] = exit_reason
     p["pnl"] = 0
     p["exit_price"] = 0
     p["closed_at"] = datetime.now(timezone.utc).isoformat()
     closed.append(p)
-    log.info("%s %s %s", exit_reason.upper(), p["asset"].upper(), p["side"])
+    log.info("%s %s %s (confirmed 0 on-chain)", exit_reason.upper(), p["asset"].upper(), p["side"])
     return True
 
 def redeem_position(condition_id):
@@ -280,7 +309,7 @@ def cancel_stale_bids():
             changed = True
     if changed:
         positions[:] = [p for p in positions if p["status"] != "done"]
-        save_json(POSITIONS_FILE, positions); save_json(CLOSED_FILE, closed[-100:])
+        save_json(POSITIONS_FILE, positions); save_json(CLOSED_FILE, closed[-500:])
 
 def manage():
     now = int(time.time())
@@ -300,19 +329,26 @@ def manage():
                 continue
             st = order_status(p["buy_order_id"])
             if st == "FILLED":
-                actual2 = token_balance(p["token_id"])
+                actual2 = token_balance_onchain(p["token_id"])
                 if actual2 > 0:
                     p["size"] = actual2
                     p["status"] = "held"
-                    log.info("FILLED %s %s: %d @ $%.2f", p["asset"].upper(), p["side"], actual2, p["buy_price"])
+                    log.info("FILLED %s %s: %d @ $%.2f (on-chain)", p["asset"].upper(), p["side"], actual2, p["buy_price"])
+                    changed = True
+                else:
+                    p["status"] = "held"
+                    p["size"] = int(p.get("cost", BID_AMOUNT) / p.get("buy_price", BID_PRICE))
+                    log.info("FILLED %s %s (CLOB=filled, keeping held)", p["asset"].upper(), p["side"])
                     changed = True
             elif st == "CANCELLED":
-                actual3 = token_balance(p["token_id"])
+                actual3 = token_balance_onchain(p["token_id"])
                 if actual3 > 0:
                     p["size"] = actual3
                     p["status"] = "held"
-                    log.info("CANCEL-BUT-FILLED %s %s: %d tokens", p["asset"].upper(), p["side"], actual3)
+                    log.info("CANCEL-BUT-FILLED %s %s: %d on-chain", p["asset"].upper(), p["side"], actual3)
                     changed = True
+                elif actual3 == -1:
+                    log.warning("CANCEL check RPC fail %s %s, keeping", p["asset"].upper(), p["side"])
                 else:
                     p["status"] = "done"
                     p["exit_type"] = "cancelled"
@@ -320,14 +356,24 @@ def manage():
                     p["exit_price"] = 0
                     p["closed_at"] = datetime.now(timezone.utc).isoformat()
                     closed.append(p)
+                    log.info("CANCELLED %s %s (confirmed 0 on-chain)", p["asset"].upper(), p["side"])
                     changed = True
 
         if p["status"] == "held" and now > p["end_ts"] + 60:
-            cid = p.get("condition_id", "")
-            if cid and cid not in redeemed_cids:
-                redeem_position(cid)
-                redeemed_cids.add(cid)
-            actual = token_balance(p["token_id"])
+            actual = token_balance_onchain(p["token_id"])
+            if actual == -1:
+                log.warning("RPC fail %s %s, skip cycle", p["asset"].upper(), p["side"])
+                continue
+            if actual > 0:
+                cid = p.get("condition_id", "")
+                if cid and cid not in redeemed_cids:
+                    redeem_position(cid)
+                    redeemed_cids.add(cid)
+                    time.sleep(2)
+                    actual = token_balance_onchain(p["token_id"])
+                    if actual is None or actual > 0:
+                        log.info("REDEEM sent, tokens remain %s %s (%s), retry next cycle", p["asset"].upper(), p["side"], actual)
+                        continue
             if actual == 0:
                 p["status"] = "done"
                 p["closed_at"] = datetime.now(timezone.utc).isoformat()
@@ -354,7 +400,7 @@ def manage():
                 changed = True
     if changed:
         positions[:] = [p for p in positions if p["status"] != "done"]
-        save_json(POSITIONS_FILE, positions); save_json(CLOSED_FILE, closed[-100:])
+        save_json(POSITIONS_FILE, positions); save_json(CLOSED_FILE, closed[-500:])
 
 def compute_trade_pnl():
     """P&L from trades only: closed results + unrealized on held positions."""
@@ -411,9 +457,9 @@ def api_sell():
         positions[:] = [x for x in positions if x["status"] != "done"]
         save_json(POSITIONS_FILE, positions)
         return jsonify({"msg": "Bid cancelled"})
-    actual = token_balance(tid)
+    actual = token_balance_onchain(tid)
     if actual < 1:
-        return jsonify({"err": "No shares"})
+        return jsonify({"err": "No shares on-chain"})
     book = get_book(tid)
     best = book["best_bid"]
     if best < 0.01:
@@ -453,7 +499,7 @@ def api_cancel():
 
 def run():
     global clob, w3, w3_account, ctf_contract, positions, closed
-    log.info("Scalper v7 | $%.0f @ $%.2f | %s | dual-window | trade-based P&L", BID_AMOUNT, BID_PRICE, "+".join(ASSETS))
+    log.info("Scalper v8 | $%.0f @ $%.2f | %s | on-chain balance checks", BID_AMOUNT, BID_PRICE, "+".join(ASSETS))
     clob = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=POLYGON)
     creds = clob.create_or_derive_api_creds()
     clob.set_api_creds(creds)
